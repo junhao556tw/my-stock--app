@@ -1,0 +1,105 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import pandas_ta as ta
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.signal import find_peaks
+import numpy as np
+
+# 設定網頁標題與排版
+st.set_page_config(page_title="時晷幾何分析系統", layout="wide")
+st.title("📈 時晷幾何分析系統 (Streamlit 版)")
+
+# --- 側邊欄控制區 ---
+st.sidebar.header("設定項目")
+target_input = st.sidebar.text_input("輸入股票代碼 (多個請用逗號隔開)", "2330.TW, 2317.TW, 2454.TW")
+run_button = st.sidebar.button("開始執行分析")
+
+# --- 核心幾何分析函數 ---
+def run_sundial_analysis(stock_id):
+    try:
+        # 1. 抓取數據
+        df = yf.download(stock_id, period="max", interval="1mo", progress=False, auto_adjust=True)
+        if df.empty or len(df) < 40: 
+            st.warning(f"{stock_id} 數據不足或不存在。")
+            return 
+        
+        if isinstance(df.columns, pd.MultiIndex): 
+            df.columns = df.columns.get_level_values(0)
+        df.columns = [str(c).lower().strip() for c in df.columns]
+
+        # 2. 指標計算
+        dmi = ta.adx(df['high'], df['low'], df['close'], length=14)
+        df['plus_di'] = dmi['DMP_14']
+        df['minus_di'] = dmi['DMN_14']
+        macd_df = ta.macd(df['close'])
+        df['macd_h'] = macd_df['MACDh_12_26_9']
+        di_p = df['plus_di'].fillna(0)
+        di_m = df['minus_di'].fillna(0)
+
+        # 3. 搜尋波峰
+        all_peaks, _ = find_peaks(di_p, distance=3, prominence=1)
+        major_peaks = [p for p in all_peaks if di_p.iloc[p] > 35] 
+        if len(major_peaks) < 1: 
+            st.info(f"{stock_id} 未偵測到主要波段。")
+            return
+        targets = major_peaks[-2:] 
+
+        # 4. 建立 Plotly 子圖
+        fig = make_subplots(
+            rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+            subplot_titles=(f"{stock_id} K線主圖", "DMI 時晷系統 (橘線: L2長軌跡)", "MACD"),
+            row_heights=[0.5, 0.35, 0.15]
+        )
+
+        fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='K線'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=di_p.index, y=di_p, name='+DI', line=dict(color='red', width=3)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=di_m.index, y=di_m, name='-DI', line=dict(color='#1E90FF', width=2)), row=2, col=1)
+
+        # 直線延伸邏輯 (與原程式相同)
+        def add_extended_line(p1_idx, p2_idx, base_y_idx, color, name, dash='dash', width=1.5):
+            x1, x2 = df.index[p1_idx].value, df.index[p2_idx].value
+            y1, y2 = di_p.iloc[p1_idx], di_p.iloc[p2_idx]
+            xb, yb = df.index[base_y_idx].value, di_p.iloc[base_y_idx]
+            if x1 == x2 or y1 == y2: return
+            slope = (y2 - y1) / (x2 - x1)
+            try:
+                x_at_0 = pd.to_datetime(xb + (0 - yb) / slope)
+                x_at_100 = pd.to_datetime(xb + (100 - yb) / slope)
+                fig.add_trace(go.Scatter(x=[x_at_0, x_at_100], y=[0, 100], mode='lines', name=name,
+                                         line=dict(color=color, width=width, dash=dash), showlegend=False), row=2, col=1)
+            except: pass
+
+        for t_idx in targets:
+            pos_list = np.where(all_peaks == t_idx)[0]
+            if len(pos_list) == 0: continue
+            current_pos = pos_list[0]
+            if current_pos >= 1:
+                lp1_idx = all_peaks[current_pos - 1]
+                add_extended_line(lp1_idx, t_idx, lp1_idx, 'yellow', 'L1')
+            if current_pos >= 3:
+                lp3_idx = all_peaks[current_pos - 3]
+                trough_idx_num = di_p.iloc[lp3_idx:t_idx].idxmin()
+                trough_pos = df.index.get_loc(trough_idx_num)
+                add_extended_line(lp3_idx, t_idx, lp3_idx, 'orange', 'L2', 'solid', 2.5)
+                add_extended_line(lp3_idx, t_idx, trough_pos, 'rgba(255, 165, 0, 0.5)', 'Support', 'dot', 1.5)
+
+        colors_macd = ['red' if val >= 0 else 'green' for val in df['macd_h']]
+        fig.add_trace(go.Bar(x=df.index, y=df['macd_h'], name='MACD', marker_color=colors_macd), row=3, col=1)
+
+        fig.update_layout(height=800, template="plotly_dark", showlegend=False, xaxis_rangeslider_visible=False)
+        fig.update_yaxes(range=[0, 100], row=2, col=1)
+        
+        # 在 Streamlit 中顯示圖表
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"分析 {stock_id} 時發生錯誤: {e}")
+
+# --- 主程式執行 ---
+if run_button:
+    stock_list = [s.strip() for s in target_input.split(',')]
+    for sid in stock_list:
+        with st.spinner(f'正在分析 {sid}...'):
+            run_sundial_analysis(sid)

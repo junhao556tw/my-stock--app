@@ -1,0 +1,112 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.signal import find_peaks
+import numpy as np
+from datetime import datetime
+
+# 1. 基礎設定
+st.set_page_config(page_title="時晷幾何分析系統", layout="wide")
+st.title("📈 時晷幾何分析系統 (穩定防錯版)")
+
+# --- 側邊欄 ---
+st.sidebar.header("控制台")
+
+# 操作優化：常用股選單
+stock_options = ["2330.TW", "2317.TW", "2454.TW", "0050.TW", "TSLA", "NVDA", "手動輸入"]
+choice = st.sidebar.selectbox("快速選擇股票", stock_options)
+
+if choice == "手動輸入":
+    stock_id = st.sidebar.text_input("輸入代碼 (例如: 2330.TW)", "2330.TW").strip().upper()
+else:
+    stock_id = choice
+
+# 數據問題：週期切換
+interval_dict = {"60分鐘": "60m", "日線": "1d", "週線": "1wk", "月線": "1mo"}
+itv_label = st.sidebar.selectbox("分析週期", list(interval_dict.keys()), index=3)
+itv_code = interval_dict[itv_label]
+
+run_btn = st.sidebar.button("執行分析")
+
+# --- 核心邏輯 ---
+def safe_analysis(sid, itv):
+    try:
+        # A. 抓取數據 (加入緩衝區確保數據足夠)
+        lookback = "2y" if itv == "60m" else "max"
+        df = yf.download(sid, period=lookback, interval=itv, progress=False, auto_adjust=True)
+        
+        # 優先解決：數據不足報錯問題
+        if df is None or df.empty:
+            st.warning(f"無法取得 {sid} 的數據，請檢查代碼是否正確。")
+            return
+            
+        if len(df) < 40:
+            st.warning(f"{sid} 的數據量過少 ({len(df)} 筆)，建議換個週期試試。")
+            return
+
+        # 清理欄位名稱 (防止 MultiIndex 報錯)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.columns = [str(c).lower().strip() for c in df.columns]
+
+        # B. DMI 計算 (Wilder's Smoothing)
+        # 使用 ewm 替代 rolling，計算更平滑且不易因空值報錯
+        df['tr'] = pd.concat([df['high']-df['low'], (df['high']-df['close'].shift()).abs(), (df['low']-df['close'].shift()).abs()], axis=1).max(axis=1)
+        df['up'] = df['high'].diff()
+        df['dn'] = df['low'].diff().multiply(-1)
+        df['+dm'] = np.where((df['up'] > df['dn']) & (df['up'] > 0), df['up'], 0)
+        df['-dm'] = np.where((df['dn'] > df['up']) & (df['dn'] > 0), df['dn'], 0)
+        
+        atr = df['tr'].ewm(alpha=1/14, adjust=False).mean()
+        df['p_di'] = 100 * (df['+dm'].ewm(alpha=1/14, adjust=False).mean() / atr)
+        df['m_di'] = 100 * (df['-dm'].ewm(alpha=1/14, adjust=False).mean() / atr)
+        df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+
+        # C. 波峰偵測
+        di_p = df['p_di'].fillna(0)
+        peaks, _ = find_peaks(di_p, distance=5, prominence=2)
+        major_peaks = [p for p in peaks if di_p.iloc[p] > 30]
+
+        # D. 繪圖 (視覺問題：座標優化)
+        fig = make_subplots(
+            rows=3, cols=1, shared_xaxes=True, 
+            vertical_spacing=0.05,
+            subplot_titles=("價格走勢 (Price)", f"DMI 時晷分析 (週期:{itv_label})", "MACD 能量柱"),
+            row_heights=[0.5, 0.35, 0.15]
+        )
+
+        # 1. K線圖
+        fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='K'), row=1, col=1)
+        
+        # 2. DMI 軌跡
+        fig.add_trace(go.Scatter(x=df.index, y=df['p_di'], name='+DI', line=dict(color='#FF4B4B', width=2.5)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['m_di'], name='-DI', line=dict(color='#00CCFF', width=1.5, dash='dot')), row=2, col=1)
+
+        # 幾何線條 (只有當有兩個以上波峰才畫，防止出錯)
+        if len(major_peaks) >= 2:
+            p1, p2 = major_peaks[-2], major_peaks[-1]
+            x_vals = [df.index[p1], df.index[p2]]
+            y_vals = [di_p.iloc[p1], di_p.iloc[p2]]
+            fig.add_trace(go.Scatter(x=x_vals, y=y_vals, mode='lines+markers', name='軌跡線', line=dict(color='yellow', width=2, dash='dash')), row=2, col=1)
+
+        # 3. MACD
+        m_colors = ['#ef5350' if v >= 0 else '#26a69a' for v in df['macd']]
+        fig.add_trace(go.Bar(x=df.index, y=df['macd'], marker_color=m_colors, name='MACD'), row=3, col=1)
+
+        # 視覺調整：座標 0-80，隱藏下方拉桿增加空間
+        fig.update_layout(height=850, template="plotly_dark", showlegend=False, xaxis_rangeslider_visible=False)
+        fig.update_yaxes(range=[0, 80], row=2, col=1) 
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        # 萬一真的出錯，顯示中文提示而非紅字崩潰
+        st.error(f"⚠️ 分析過程中發生了一點小問題: {str(e)}")
+        st.info("建議檢查：1.股票代碼是否包含 .TW  2.目前市場是否有數據。")
+
+# --- 執行入口 ---
+if run_btn:
+    with st.spinner('老哥請稍等，正在精算幾何軌跡...'):
+        safe_analysis(stock_id, itv_code)

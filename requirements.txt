@@ -4,4 +4,3 @@ plotly
 scipy
 streamlit
 numpy
-pandas_ta
